@@ -14,13 +14,15 @@ import sqlite3
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+import fnmatch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QLineEdit,
                              QProgressBar, QMenuBar, QMenu, QToolBar, QTabWidget, QStatusBar,
                              QFrame, QToolButton, QStyle, QHeaderView, QAbstractItemView,
                              QWidgetAction, QCheckBox, QDialog, QFormLayout, QSpinBox,
-                             QDoubleSpinBox, QDialogButtonBox, QInputDialog)
+                             QDoubleSpinBox, QDialogButtonBox, QInputDialog, QComboBox,
+                             QListWidget, QListWidgetItem)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QColor, QFont
 from ipaddress import IPv4Network
@@ -233,6 +235,10 @@ class NetworkScanner(QObject):
         ssdp_prefetch_thread.start()
         wsd_prefetch_thread = threading.Thread(target=self._discover_wsd_names_cached, daemon=True)
         wsd_prefetch_thread.start()
+        vendor_prefetch_thread = threading.Thread(target=self._ensure_vendor_registry_loaded, daemon=True)
+        vendor_prefetch_thread.start()
+        local_mac_prefetch_thread = threading.Thread(target=self._load_local_interface_macs, daemon=True)
+        local_mac_prefetch_thread.start()
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
@@ -251,7 +257,7 @@ class NetworkScanner(QObject):
                         self.alive_count += 1
                         self.add_device.emit({
                             'ip': ip,
-                            'name': self._make_loading_marker('name', 1, self.HOSTNAME_METHOD_COUNT),
+                            'name': self._make_loading_marker('name', 6, self.HOSTNAME_METHOD_COUNT),
                             'mac': '',
                             'manufacturer': self._make_loading_marker(
                                 'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
@@ -293,7 +299,7 @@ class NetworkScanner(QObject):
         try:
             device_state = {
                 'ip': ip,
-                'name': self._make_loading_marker('name', 1, self.HOSTNAME_METHOD_COUNT),
+                'name': self._make_loading_marker('name', 6, self.HOSTNAME_METHOD_COUNT),
                 'mac': '',
                 'manufacturer': self._make_loading_marker(
                     'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
@@ -315,15 +321,24 @@ class NetworkScanner(QObject):
                 emit_state()
 
             emit_state()
-            name = self._get_hostname(ip, progress_callback=on_name_progress)
+            with ThreadPoolExecutor(max_workers=2) as detail_executor:
+                hostname_future = detail_executor.submit(self._get_hostname, ip, on_name_progress)
+                mac_future = detail_executor.submit(self._get_mac_from_arp, ip)
+
+                mac = mac_future.result()
+                device_state['mac'] = mac
+
+                manufacturer = self._get_manufacturer_from_mac(
+                    mac,
+                    progress_callback=on_manufacturer_progress
+                )
+                device_state['manufacturer'] = manufacturer
+                emit_state()
+
+                name = hostname_future.result()
+
             device_state['name'] = name
-            emit_state()
-
-            mac = self._get_mac_from_arp(ip)
             device_state['mac'] = mac
-
-            manufacturer = self._get_manufacturer_from_mac(mac, progress_callback=on_manufacturer_progress)
-            device_state['manufacturer'] = manufacturer
             emit_state()
             self.update_progress.emit(f"Updated: {ip} - {name}")
         except Exception:
@@ -357,184 +372,50 @@ class NetworkScanner(QObject):
             if progress_callback:
                 progress_callback(method_number, self.HOSTNAME_METHOD_COUNT)
 
-        # Method 1: Reverse DNS lookup
-        report_progress(1)
-        try:
-            hostname = socket.gethostbyaddr(ip)[0].split('.')[0]
-            hostname = self._clean_hostname(hostname)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 2: Ping name resolution often exposes the Windows host name.
-        report_progress(2)
-        try:
-            output = subprocess.check_output(
-                ['ping', '-a', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=self.process_timeout_sec
-            )
-            match = re.search(r'Pinging\s+(.+?)\s+\[' + re.escape(ip) + r'\]', output, re.IGNORECASE)
-            if match:
-                hostname = self._clean_hostname(match.group(1))
+        def run_probe(method_number, probe):
+            report_progress(method_number)
+            try:
+                hostname = probe()
                 if hostname:
                     return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
+            except Exception:
+                return None
+            return None
 
-        # Method 3: NetBIOS via nbtstat is often the best source for Windows PC names.
-        report_progress(3)
-        try:
-            output = subprocess.check_output(
-                ['nbtstat', '-A', ip],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.2
-            )
-            hostname = self._extract_hostname_from_nbtstat(output)
+        # Fast in-memory / cached probes first.
+        fast_probes = [
+            (6, lambda: self._lookup_ssdp_friendly_name(ip)),
+            (1, lambda: self._clean_hostname(socket.gethostbyaddr(ip)[0].split('.')[0])),
+            (5, lambda: self._lookup_mdns_service_name(ip)),
+            (7, lambda: self._lookup_wsd_friendly_name(ip)),
+        ]
+        for method_number, probe in fast_probes:
+            hostname = run_probe(method_number, probe)
             if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
+                return hostname
 
-        # Method 4: mDNS reverse lookup helps with Macs, Linux boxes, and IoT devices.
-        report_progress(4)
-        try:
-            hostname = self._query_mdns_ptr(ip)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
+        # Medium-cost probes race in parallel so the first good answer wins.
+        medium_probe_defs = [
+            (2, lambda: self._hostname_from_ping_a(ip)),
+            (3, lambda: self._hostname_from_nbtstat(ip)),
+            (4, lambda: self._query_mdns_ptr(ip)),
+            (8, lambda: self._lookup_snmp_sysname(ip)),
+            (9, lambda: self._hostname_from_resolve_dns(ip)),
+            (10, lambda: self._hostname_from_nslookup(ip)),
+        ]
+        hostname = self._run_hostname_probe_batch(ip, medium_probe_defs, report_progress, max_workers=4)
+        if hostname:
+            return hostname
 
-        # Method 5: DNS-SD browsing often exposes service instance names for non-Windows devices.
-        report_progress(5)
-        try:
-            hostname = self._lookup_mdns_service_name(ip)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 6: SSDP/UPnP often exposes a friendlyName for consumer devices.
-        report_progress(6)
-        try:
-            hostname = self._lookup_ssdp_friendly_name(ip)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 7: WS-Discovery can expose a FriendlyName for printers and Windows devices.
-        report_progress(7)
-        try:
-            hostname = self._lookup_wsd_friendly_name(ip)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 8: SNMP sysName helps for switches, APs, printers, and managed devices.
-        report_progress(8)
-        try:
-            hostname = self._lookup_snmp_sysname(ip)
-            if hostname:
-                return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 9: Resolve-DnsName can return PTR results where socket/nslookup fail.
-        report_progress(9)
-        try:
-            output = subprocess.check_output(
-                [
-                    'powershell',
-                    '-NoProfile',
-                    '-Command',
-                    (
-                        f"$result = Resolve-DnsName -Name {ip} -Type PTR -ErrorAction SilentlyContinue; "
-                        "if ($result) { $result.NameHost }"
-                    )
-                ],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.5
-            )
-            for line in output.split('\n'):
-                hostname = self._clean_hostname(line)
-                if hostname:
-                    return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 10: nslookup can succeed where reverse DNS via socket fails.
-        report_progress(10)
-        try:
-            output = subprocess.check_output(
-                ['nslookup', ip],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.2
-            )
-            for line in output.split('\n'):
-                line = line.strip()
-                if line.lower().startswith('name:'):
-                    hostname = self._clean_hostname(line.split(':', 1)[1].strip())
-                    if hostname:
-                        return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 11: Ask WMI for the computer system name.
-        report_progress(11)
-        try:
-            output = subprocess.check_output(
-                ['wmic', '/node:' + ip, 'computersystem', 'get', 'name'],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.5
-            )
-            for line in output.split('\n'):
-                hostname = self._clean_hostname(line)
-                if hostname:
-                    return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 12: Ask WMI for DNS host names from NIC configuration.
-        report_progress(12)
-        try:
-            output = subprocess.check_output(
-                ['wmic', '/node:' + ip, 'nicconfig', 'get', 'dnshostname'],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.5
-            )
-            for line in output.split('\n'):
-                hostname = self._clean_hostname(line)
-                if hostname:
-                    return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
-
-        # Method 13: net view sometimes includes a server name banner.
-        report_progress(13)
-        try:
-            output = subprocess.check_output(
-                f'net view \\\\{ip}',
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.2
-            )
-            first_line = output.split('\n', 1)[0].strip()
-            match = re.search(r'\\\\([^\\\s]+)', first_line)
-            if match:
-                hostname = self._clean_hostname(match.group(1))
-                if hostname:
-                    return self._cache_hostname(ip, hostname)
-        except Exception:
-            pass
+        # Slow Windows-specific fallbacks last.
+        slow_probe_defs = [
+            (11, lambda: self._hostname_from_wmic_computersystem(ip)),
+            (12, lambda: self._hostname_from_wmic_nicconfig(ip)),
+            (13, lambda: self._hostname_from_net_view(ip)),
+        ]
+        hostname = self._run_hostname_probe_batch(ip, slow_probe_defs, report_progress, max_workers=3)
+        if hostname:
+            return hostname
 
         return "Unknown"
 
@@ -543,6 +424,127 @@ class NetworkScanner(QObject):
         with self.hostname_cache_lock:
             self.hostname_cache[ip] = hostname
         return hostname
+
+    def _run_hostname_probe_batch(self, ip, probe_defs, report_progress, max_workers):
+        """Race a batch of hostname probes and return the first successful result."""
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for method_number, probe in probe_defs:
+                report_progress(method_number)
+                future_map[executor.submit(probe)] = method_number
+
+            for future in as_completed(future_map):
+                try:
+                    hostname = future.result()
+                except Exception:
+                    continue
+                if hostname:
+                    return self._cache_hostname(ip, hostname)
+
+        return None
+
+    def _hostname_from_ping_a(self, ip):
+        """Extract a hostname from `ping -a`."""
+        output = subprocess.check_output(
+            ['ping', '-a', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=self.process_timeout_sec
+        )
+        match = re.search(r'Pinging\s+(.+?)\s+\[' + re.escape(ip) + r'\]', output, re.IGNORECASE)
+        if match:
+            return self._clean_hostname(match.group(1))
+        return None
+
+    def _hostname_from_nbtstat(self, ip):
+        """Extract a hostname from NetBIOS data."""
+        output = subprocess.check_output(
+            ['nbtstat', '-A', ip],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.8
+        )
+        return self._extract_hostname_from_nbtstat(output)
+
+    def _hostname_from_resolve_dns(self, ip):
+        """Extract a hostname using PowerShell Resolve-DnsName."""
+        output = subprocess.check_output(
+            [
+                'powershell',
+                '-NoProfile',
+                '-Command',
+                (
+                    f"$result = Resolve-DnsName -Name {ip} -Type PTR -ErrorAction SilentlyContinue; "
+                    "if ($result) { $result.NameHost }"
+                )
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.9
+        )
+        for line in output.split('\n'):
+            hostname = self._clean_hostname(line)
+            if hostname:
+                return hostname
+        return None
+
+    def _hostname_from_nslookup(self, ip):
+        """Extract a hostname using nslookup."""
+        output = subprocess.check_output(
+            ['nslookup', ip],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.8
+        )
+        for line in output.split('\n'):
+            line = line.strip()
+            if line.lower().startswith('name:'):
+                hostname = self._clean_hostname(line.split(':', 1)[1].strip())
+                if hostname:
+                    return hostname
+        return None
+
+    def _hostname_from_wmic_computersystem(self, ip):
+        """Extract a hostname from WMI computer system data."""
+        output = subprocess.check_output(
+            ['wmic', '/node:' + ip, 'computersystem', 'get', 'name'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.9
+        )
+        for line in output.split('\n'):
+            hostname = self._clean_hostname(line)
+            if hostname:
+                return hostname
+        return None
+
+    def _hostname_from_wmic_nicconfig(self, ip):
+        """Extract a hostname from WMI NIC config data."""
+        output = subprocess.check_output(
+            ['wmic', '/node:' + ip, 'nicconfig', 'get', 'dnshostname'],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.9
+        )
+        for line in output.split('\n'):
+            hostname = self._clean_hostname(line)
+            if hostname:
+                return hostname
+        return None
+
+    def _hostname_from_net_view(self, ip):
+        """Extract a hostname from `net view` output."""
+        output = subprocess.check_output(
+            f'net view \\\\{ip}',
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.8
+        )
+        first_line = output.split('\n', 1)[0].strip()
+        match = re.search(r'\\\\([^\\\s]+)', first_line)
+        if match:
+            return self._clean_hostname(match.group(1))
+        return None
 
     def _lookup_ssdp_friendly_name(self, ip):
         """Resolve a host name from SSDP/UPnP metadata."""
@@ -2693,7 +2695,7 @@ class NetworkScanner(QObject):
 
 
 class NetworkDiscoveryApp(QMainWindow):
-    device_status_resolved = pyqtSignal(str, str, str)
+    device_status_resolved = pyqtSignal(str, str, str, int, int)
     device_status_refresh_finished = pyqtSignal(int)
 
     def __init__(self):
@@ -2711,15 +2713,19 @@ class NetworkDiscoveryApp(QMainWindow):
         self.device_items = {}  # Track device tree items by IP
         self.is_scanning = False
         self.is_refreshing_status = False
+        self.status_refresh_thread = None
         self.storage_db_path = self.scanner.storage_db_path
         self.favorites = {}  # Store favorites as {ip: device_info}
         self.nicknames = {}
         self.device_status_cache = {}
+        self.device_ping_stats = {}
+        self.device_scan_details = {}
         self._ensure_storage_db()
         self.settings = self.default_settings()
         self.load_settings()
         self.load_nicknames()
         self.load_device_statuses()
+        self.load_device_ping_stats()
         self.load_favorites()
         self.init_ui()
         self.populate_favorites_tab()
@@ -2760,6 +2766,14 @@ class NetworkDiscoveryApp(QMainWindow):
                         updated_at REAL NOT NULL
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS device_ping_stats (
+                        device_key TEXT PRIMARY KEY,
+                        success_count INTEGER NOT NULL,
+                        total_count INTEGER NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                """)
         except Exception:
             pass
 
@@ -2772,6 +2786,7 @@ class NetworkDiscoveryApp(QMainWindow):
             'ping_timeout_ms': self.scanner.ping_timeout_ms,
             'process_timeout_sec': self.scanner.process_timeout_sec,
             'named_only_default': False,
+            'name_filter_rules': [],
         }
 
     def load_settings(self):
@@ -2859,6 +2874,24 @@ class NetworkDiscoveryApp(QMainWindow):
         except Exception:
             self.device_status_cache = {}
 
+    def load_device_ping_stats(self):
+        """Load cached ping-response details from local SQLite storage."""
+        self.device_ping_stats = {}
+        try:
+            with self._db_connect() as conn:
+                rows = conn.execute(
+                    "SELECT device_key, success_count, total_count, updated_at FROM device_ping_stats"
+                ).fetchall()
+            for device_key, success_count, total_count, updated_at in rows:
+                if device_key:
+                    self.device_ping_stats[device_key] = {
+                        'success_count': int(success_count),
+                        'total_count': int(total_count),
+                        'updated_at': float(updated_at),
+                    }
+        except Exception:
+            self.device_ping_stats = {}
+
     def save_device_status(self, ip, mac, status_text):
         """Persist one device status to local SQLite storage."""
         device_key = self.get_favorite_key(ip, mac)
@@ -2890,6 +2923,44 @@ class NetworkDiscoveryApp(QMainWindow):
         if ip_key and ip_key in self.device_status_cache:
             return self.device_status_cache[ip_key]
         return 'Unknown'
+
+    def save_device_ping_stats(self, ip, mac, success_count, total_count):
+        """Persist ping-response details for one device."""
+        device_key = self.get_favorite_key(ip, mac)
+        if not device_key:
+            return
+
+        payload = {
+            'success_count': int(success_count),
+            'total_count': int(total_count),
+            'updated_at': time.time(),
+        }
+        self.device_ping_stats[device_key] = payload
+        try:
+            with self._db_connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO device_ping_stats (device_key, success_count, total_count, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(device_key) DO UPDATE SET
+                        success_count = excluded.success_count,
+                        total_count = excluded.total_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (device_key, payload['success_count'], payload['total_count'], payload['updated_at'])
+                )
+        except Exception:
+            pass
+
+    def get_device_ping_stats(self, ip, mac=''):
+        """Return cached ping-response details for a device."""
+        device_key = self.get_favorite_key(ip, mac)
+        if device_key and device_key in self.device_ping_stats:
+            return self.device_ping_stats[device_key]
+        ip_key = self.get_favorite_key(ip, '')
+        if ip_key and ip_key in self.device_ping_stats:
+            return self.device_ping_stats[ip_key]
+        return None
 
     def get_favorite_key(self, ip='', mac=''):
         """Build a stable favorite key, preferring MAC over IP."""
@@ -2997,6 +3068,43 @@ class NetworkDiscoveryApp(QMainWindow):
         if nickname:
             return True
         return self.has_found_name(item.data(1, Qt.UserRole) or '')
+
+    def get_item_name_filter_target(self, item):
+        """Return the best name-like text for wildcard name filtering."""
+        if item is None:
+            return ''
+        nickname = (item.data(1, Qt.UserRole + 1) or '').strip()
+        raw_name = (item.data(1, Qt.UserRole) or '').strip()
+        if nickname:
+            return nickname
+        if self.has_found_name(raw_name):
+            return raw_name
+        return item.text(1).strip()
+
+    def item_matches_name_filter_rules(self, item):
+        """Return True when a row matches the configured wildcard name rules."""
+        rules = getattr(self, 'name_filter_rules', []) or []
+        if not rules:
+            return True
+
+        target = self.get_item_name_filter_target(item).lower()
+        include_rules = []
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            pattern = str(rule.get('pattern', '')).strip().lower()
+            mode = str(rule.get('mode', 'include')).strip().lower()
+            if not pattern:
+                continue
+            if mode == 'exclude' and fnmatch.fnmatchcase(target, pattern):
+                return False
+            if mode == 'include':
+                include_rules.append(pattern)
+
+        if include_rules:
+            return any(fnmatch.fnmatchcase(target, pattern) for pattern in include_rules)
+        return True
 
     def has_found_name(self, name):
         """Return True when the scanner found a usable host name."""
@@ -3424,6 +3532,10 @@ class NetworkDiscoveryApp(QMainWindow):
             "Unfavorite" if self.is_favorited_device(item.text(2), item.text(4)) else "Favorite"
         )
         action.triggered.connect(lambda: self.toggle_favorite(item))
+        info_action = menu.addAction("View Info")
+        info_action.triggered.connect(lambda: self.show_device_info_dialog(item))
+        open_explorer_action = menu.addAction("Open In Explorer")
+        open_explorer_action.triggered.connect(lambda: self.open_device_in_explorer(item))
         nickname_action = menu.addAction("Set Nickname")
         nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
         if self.get_device_nickname(item.text(2), item.text(4)):
@@ -3444,12 +3556,113 @@ class NetworkDiscoveryApp(QMainWindow):
         menu = QMenu()
         action = menu.addAction("Unfavorite")
         action.triggered.connect(lambda: self.remove_favorite(favorite_key))
+        info_action = menu.addAction("View Info")
+        info_action.triggered.connect(lambda: self.show_device_info_dialog(item))
+        open_explorer_action = menu.addAction("Open In Explorer")
+        open_explorer_action.triggered.connect(lambda: self.open_device_in_explorer(item))
         nickname_action = menu.addAction("Set Nickname")
         nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
         if self.get_device_nickname(item.text(2), item.text(4)):
             clear_nickname_action = menu.addAction("Clear Nickname")
             clear_nickname_action.triggered.connect(lambda: self.clear_nickname_for_item(item))
         menu.exec_(self.favorites_tree.mapToGlobal(position))
+
+    def build_device_info(self, item):
+        """Collect a device info snapshot for dialogs and actions."""
+        ip = item.text(2)
+        mac = item.text(4)
+        raw_name = item.data(1, Qt.UserRole) or ''
+        nickname = self.get_device_nickname(ip, mac)
+        display_name = self.get_display_name(raw_name, ip, mac)
+        ping_stats = self.get_device_ping_stats(ip, mac)
+        favorite = self.is_favorited_device(ip, mac)
+        device_key = self.get_favorite_key(ip, mac)
+        status_text = item.text(0) or self.get_cached_device_status(ip, mac)
+        status_updated_at = ''
+
+        if ping_stats and ping_stats.get('updated_at'):
+            status_updated_at = time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                time.localtime(ping_stats['updated_at'])
+            )
+
+        return {
+            'display_name': display_name,
+            'raw_name': raw_name,
+            'nickname': nickname,
+            'status': status_text,
+            'ip': ip,
+            'mac': mac,
+            'manufacturer': item.text(3),
+            'favorite': 'Yes' if favorite else 'No',
+            'network_path': f'\\\\{ip}' if ip else '',
+            'device_key': device_key,
+            'ping_stats': ping_stats,
+            'status_updated_at': status_updated_at,
+        }
+
+    def show_device_info_dialog(self, item):
+        """Open a small info window for one device."""
+        info = self.build_device_info(item)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Device Info')
+        dialog.setModal(False)
+        dialog.resize(520, 0)
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        ping_stats = info['ping_stats']
+        ping_summary = 'No detailed ping data yet'
+        if ping_stats:
+            success_count = ping_stats.get('success_count', 0)
+            total_count = max(1, ping_stats.get('total_count', 0))
+            percent = int(round((success_count / total_count) * 100))
+            ping_summary = f'{success_count}/{total_count} ({percent}%)'
+
+        fields = [
+            ('Display name', info['display_name'] or 'Unknown'),
+            ('Nickname', info['nickname'] or ''),
+            ('Discovered name', info['raw_name'] or ''),
+            ('Status', info['status'] or 'Unknown'),
+            ('Ping response rate', ping_summary),
+            ('Last status update', info['status_updated_at'] or ''),
+            ('IP address', info['ip'] or ''),
+            ('MAC address', info['mac'] or ''),
+            ('Manufacturer', info['manufacturer'] or ''),
+            ('Favorite', info['favorite']),
+            ('Network path', info['network_path'] or ''),
+            ('Device key', info['device_key'] or ''),
+        ]
+
+        for label_text, value_text in fields:
+            value_label = QLabel(value_text)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value_label.setWordWrap(True)
+            form.addRow(label_text, value_label)
+
+        layout.addLayout(form)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        dialog.show()
+
+    def open_device_in_explorer(self, item):
+        """Open the device as a network location in Windows Explorer."""
+        ip = item.text(2).strip()
+        if not ip:
+            self.update_status('This device has no IP address to open')
+            return
+
+        network_path = f'\\\\{ip}'
+        try:
+            subprocess.Popen(['explorer', network_path])
+            self.update_status(f'Opened {network_path} in Explorer')
+        except Exception:
+            self.update_status(f'Could not open {network_path} in Explorer')
 
     def prompt_for_nickname(self, item):
         """Prompt the user to set a custom nickname for a device."""
@@ -3566,6 +3779,7 @@ class NetworkDiscoveryApp(QMainWindow):
     def refresh_all_statuses(self):
         """Re-ping listed devices sequentially in the background."""
         if self.is_refreshing_status:
+            self.update_status('Status refresh is already running')
             return
 
         devices_to_refresh = []
@@ -3594,6 +3808,7 @@ class NetworkDiscoveryApp(QMainWindow):
 
         self.is_refreshing_status = True
         self.refresh_status_btn.setEnabled(False)
+        self.refresh_status_btn.setText('Refreshing...')
         self.update_status(f'Refreshing status for {len(devices_to_refresh)} devices...')
         self.apply_filter()
 
@@ -3602,20 +3817,30 @@ class NetworkDiscoveryApp(QMainWindow):
             args=(devices_to_refresh,),
             daemon=True
         )
+        self.status_refresh_thread = refresh_thread
         refresh_thread.start()
 
     def _refresh_statuses_worker(self, devices_to_refresh):
         """Refresh statuses one device at a time off the UI thread."""
         refreshed_count = 0
-        for ip, mac in devices_to_refresh:
-            status_text = self.get_device_status_text(ip)
-            self.device_status_resolved.emit(ip, mac, status_text)
-            refreshed_count += 1
-        self.device_status_refresh_finished.emit(refreshed_count)
+        try:
+            for ip, mac in devices_to_refresh:
+                status_info = self.get_device_status_info(ip)
+                self.device_status_resolved.emit(
+                    ip,
+                    mac,
+                    status_info['status'],
+                    status_info['success_count'],
+                    status_info['total_count']
+                )
+                refreshed_count += 1
+        finally:
+            self.device_status_refresh_finished.emit(refreshed_count)
 
-    def _apply_resolved_device_status(self, ip, mac, status_text):
+    def _apply_resolved_device_status(self, ip, mac, status_text, success_count, total_count):
         """Apply one resolved status update to all matching rows."""
         self.save_device_status(ip, mac, status_text)
+        self.save_device_ping_stats(ip, mac, success_count, total_count)
 
         item = self.device_items.get(ip)
         if item is not None:
@@ -3634,7 +3859,9 @@ class NetworkDiscoveryApp(QMainWindow):
     def _finish_status_refresh(self, refreshed_count):
         """Re-enable the refresh button after the sequential status pass."""
         self.is_refreshing_status = False
+        self.status_refresh_thread = None
         self.refresh_status_btn.setEnabled(True)
+        self.refresh_status_btn.setText('Refresh Status')
         self.apply_filter()
         self.update_status(f'Refreshed status for {refreshed_count} devices')
 
@@ -3948,11 +4175,11 @@ class NetworkDiscoveryApp(QMainWindow):
 
         return tree
 
-    def get_device_status_text(self, ip):
-        """Return Online or Offline based on a quick ping check."""
+    def get_device_status_info(self, ip):
+        """Return ping-response details for a device status check."""
         clean_ip = (ip or '').strip()
         if not clean_ip:
-            return 'Offline'
+            return {'status': 'Offline', 'success_count': 0, 'total_count': 10}
 
         try:
             result = subprocess.run(
@@ -3963,11 +4190,19 @@ class NetworkDiscoveryApp(QMainWindow):
             )
             output = result.stdout or ''
             match = re.search(r'Received\s*=\s*(\d+)', output, re.IGNORECASE)
-            if match and int(match.group(1)) > 0:
-                return 'Online'
-            return 'Online' if result.returncode == 0 else 'Offline'
+            success_count = int(match.group(1)) if match else (10 if result.returncode == 0 else 0)
+            total_count = 10
+            return {
+                'status': 'Online' if success_count > 0 else 'Offline',
+                'success_count': success_count,
+                'total_count': total_count,
+            }
         except Exception:
-            return 'Offline'
+            return {'status': 'Offline', 'success_count': 0, 'total_count': 10}
+
+    def get_device_status_text(self, ip):
+        """Return Online or Offline based on a quick ping check."""
+        return self.get_device_status_info(ip)['status']
 
     def resolve_status_for_device(self, device):
         """Prefer provided or cached status before falling back to a live ping."""
@@ -4002,11 +4237,17 @@ class NetworkDiscoveryApp(QMainWindow):
         if item.parent() is None:
             manufacturer_filter = getattr(self, 'manufacturer_filter_text', '')
             named_only_filter = getattr(self, 'named_only_filter', False)
+            online_only_filter = getattr(self, 'online_only_filter', False)
             manufacturer_text = item.text(3).lower()
+            status_text = item.text(0).strip().lower()
 
             if manufacturer_filter and manufacturer_filter not in manufacturer_text:
                 return False
             if named_only_filter and not self.item_has_display_name(item):
+                return False
+            if online_only_filter and status_text != 'online':
+                return False
+            if not self.item_matches_name_filter_rules(item):
                 return False
 
         if not query:
@@ -4290,6 +4531,8 @@ class NetworkDiscoveryApp(QMainWindow):
         """Initialize a layout styled after Advanced IP Scanner."""
         self.manufacturer_filter_text = ''
         self.named_only_filter = bool(self.settings.get('named_only_default', False))
+        self.online_only_filter = False
+        self.name_filter_rules = list(self.settings.get('name_filter_rules', []))
 
         self.setWindowTitle('Advanced IP Scanner')
         self.setGeometry(80, 80, 1080, 720)
@@ -4581,6 +4824,16 @@ class NetworkDiscoveryApp(QMainWindow):
         self.named_only_checkbox.stateChanged.connect(lambda _: self.apply_filter_menu())
         layout.addWidget(self.named_only_checkbox)
 
+        self.online_only_checkbox = QCheckBox('Only show online devices')
+        self.online_only_checkbox.setChecked(self.online_only_filter)
+        self.online_only_checkbox.stateChanged.connect(lambda _: self.apply_filter_menu())
+        layout.addWidget(self.online_only_checkbox)
+
+        self.name_filters_button = QPushButton('Name Filters...')
+        self.name_filters_button.setObjectName('SettingsButton')
+        self.name_filters_button.clicked.connect(self.open_name_filters_dialog)
+        layout.addWidget(self.name_filters_button)
+
         action = QWidgetAction(self.filter_menu)
         action.setDefaultWidget(filter_widget)
         self.filter_menu.addAction(action)
@@ -4590,6 +4843,7 @@ class NetworkDiscoveryApp(QMainWindow):
         """Apply the popup filter settings immediately."""
         self.manufacturer_filter_text = self.manufacturer_filter_input.text().strip().lower()
         self.named_only_filter = self.named_only_checkbox.isChecked()
+        self.online_only_filter = self.online_only_checkbox.isChecked()
         self.update_filter_button_text()
         self.apply_filter()
 
@@ -4598,10 +4852,107 @@ class NetworkDiscoveryApp(QMainWindow):
         if not hasattr(self, 'filter_button') or self.filter_button is None:
             return
 
-        if self.manufacturer_filter_text or self.named_only_filter:
+        if (
+            self.manufacturer_filter_text
+            or self.named_only_filter
+            or self.online_only_filter
+            or self.name_filter_rules
+        ):
             self.filter_button.setText('Filter •')
         else:
             self.filter_button.setText('Filter ▾')
+
+    def _refresh_name_filter_rules_list(self):
+        """Render the current wildcard name rules into the dialog list."""
+        if not hasattr(self, 'name_filter_rules_list') or self.name_filter_rules_list is None:
+            return
+
+        self.name_filter_rules_list.clear()
+        for rule in self.name_filter_rules:
+            mode = str(rule.get('mode', 'include')).strip().capitalize()
+            pattern = str(rule.get('pattern', '')).strip()
+            if not pattern:
+                continue
+            list_item = QListWidgetItem(f'{mode}: {pattern}')
+            list_item.setData(Qt.UserRole, {'mode': mode.lower(), 'pattern': pattern})
+            self.name_filter_rules_list.addItem(list_item)
+
+    def _commit_name_filter_rules(self):
+        """Persist wildcard name rules and apply them immediately."""
+        self.settings['name_filter_rules'] = list(self.name_filter_rules)
+        self.save_settings()
+        self.update_filter_button_text()
+        self.apply_filter()
+
+    def add_name_filter_rule(self):
+        """Add one wildcard name filter rule."""
+        pattern = self.name_filter_pattern_input.text().strip()
+        if not pattern:
+            return
+
+        mode = self.name_filter_mode_combo.currentText().strip().lower()
+        self.name_filter_rules.append({'mode': mode, 'pattern': pattern})
+        self.name_filter_pattern_input.clear()
+        self._refresh_name_filter_rules_list()
+        self._commit_name_filter_rules()
+
+    def remove_selected_name_filter_rule(self):
+        """Remove the selected wildcard name filter rule."""
+        current_row = self.name_filter_rules_list.currentRow()
+        if current_row < 0 or current_row >= len(self.name_filter_rules):
+            return
+
+        del self.name_filter_rules[current_row]
+        self._refresh_name_filter_rules_list()
+        self._commit_name_filter_rules()
+
+    def open_name_filters_dialog(self):
+        """Open a dialog for include/exclude wildcard name rules."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Name Filters')
+        dialog.setModal(False)
+        dialog.resize(480, 0)
+
+        layout = QVBoxLayout(dialog)
+
+        help_label = QLabel(
+            'Add include/exclude wildcard rules for device names. '
+            'Use * for any text, and you can use multiple * characters.'
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        input_row = QHBoxLayout()
+        self.name_filter_mode_combo = QComboBox(dialog)
+        self.name_filter_mode_combo.addItems(['Include', 'Exclude'])
+        input_row.addWidget(self.name_filter_mode_combo)
+
+        self.name_filter_pattern_input = QLineEdit(dialog)
+        self.name_filter_pattern_input.setPlaceholderText('Examples: DESKTOP-* or Samsung*TV')
+        self.name_filter_pattern_input.returnPressed.connect(self.add_name_filter_rule)
+        input_row.addWidget(self.name_filter_pattern_input, 1)
+
+        add_button = QPushButton('Add')
+        add_button.setObjectName('SettingsButton')
+        add_button.clicked.connect(self.add_name_filter_rule)
+        input_row.addWidget(add_button)
+        layout.addLayout(input_row)
+
+        self.name_filter_rules_list = QListWidget(dialog)
+        layout.addWidget(self.name_filter_rules_list)
+        self._refresh_name_filter_rules_list()
+
+        remove_button = QPushButton('Remove Selected')
+        remove_button.setObjectName('SettingsButton')
+        remove_button.clicked.connect(self.remove_selected_name_filter_rule)
+        layout.addWidget(remove_button)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(dialog.reject)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+
+        dialog.show()
 
     def open_settings_dialog(self):
         """Open a settings window for scan behavior and defaults."""
