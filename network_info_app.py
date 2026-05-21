@@ -384,9 +384,9 @@ class NetworkScanner(QObject):
 
         # Fast in-memory / cached probes first.
         fast_probes = [
+            (5, lambda: self._lookup_mdns_service_name(ip)),
             (6, lambda: self._lookup_ssdp_friendly_name(ip)),
             (1, lambda: self._clean_hostname(socket.gethostbyaddr(ip)[0].split('.')[0])),
-            (5, lambda: self._lookup_mdns_service_name(ip)),
             (7, lambda: self._lookup_wsd_friendly_name(ip)),
         ]
         for method_number, probe in fast_probes:
@@ -2714,6 +2714,7 @@ class NetworkDiscoveryApp(QMainWindow):
         self.is_scanning = False
         self.is_refreshing_status = False
         self.status_refresh_thread = None
+        self.status_refresh_workers = min(12, max(4, (os.cpu_count() or 4) * 2))
         self.storage_db_path = self.scanner.storage_db_path
         self.favorites = {}  # Store favorites as {ip: device_info}
         self.nicknames = {}
@@ -3821,19 +3822,34 @@ class NetworkDiscoveryApp(QMainWindow):
         refresh_thread.start()
 
     def _refresh_statuses_worker(self, devices_to_refresh):
-        """Refresh statuses one device at a time off the UI thread."""
+        """Refresh statuses in a bounded parallel batch off the UI thread."""
         refreshed_count = 0
         try:
-            for ip, mac in devices_to_refresh:
-                status_info = self.get_device_status_info(ip)
-                self.device_status_resolved.emit(
-                    ip,
-                    mac,
-                    status_info['status'],
-                    status_info['success_count'],
-                    status_info['total_count']
-                )
-                refreshed_count += 1
+            with ThreadPoolExecutor(max_workers=self.status_refresh_workers) as executor:
+                future_map = {
+                    executor.submit(self.get_device_status_info, ip): (ip, mac)
+                    for ip, mac in devices_to_refresh
+                }
+
+                for future in as_completed(future_map):
+                    ip, mac = future_map[future]
+                    try:
+                        status_info = future.result()
+                    except Exception:
+                        status_info = {
+                            'status': 'Offline',
+                            'success_count': 0,
+                            'total_count': 10,
+                        }
+
+                    self.device_status_resolved.emit(
+                        ip,
+                        mac,
+                        status_info['status'],
+                        status_info['success_count'],
+                        status_info['total_count']
+                    )
+                    refreshed_count += 1
         finally:
             self.device_status_refresh_finished.emit(refreshed_count)
 
