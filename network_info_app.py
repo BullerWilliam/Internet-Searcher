@@ -4202,7 +4202,7 @@ class NetworkDiscoveryApp(QMainWindow):
                 ['ping', '-n', '10', '-w', str(self.scanner.ping_timeout_ms), clean_ip],
                 capture_output=True,
                 text=True,
-                timeout=max(3.0, self.scanner.process_timeout_sec * 12)
+                timeout=2.0
             )
             output = result.stdout or ''
             match = re.search(r'Received\s*=\s*(\d+)', output, re.IGNORECASE)
