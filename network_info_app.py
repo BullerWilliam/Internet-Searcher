@@ -2696,6 +2696,7 @@ class NetworkScanner(QObject):
 
 class NetworkDiscoveryApp(QMainWindow):
     device_status_resolved = pyqtSignal(str, str, str, int, int)
+    device_status_progress = pyqtSignal(str, str, int, int)
     device_status_refresh_finished = pyqtSignal(int)
 
     def __init__(self):
@@ -2708,6 +2709,7 @@ class NetworkDiscoveryApp(QMainWindow):
         self.scanner.status_update.connect(self.update_device_count)
         self.scanner.progress_update.connect(self.update_progress)
         self.device_status_resolved.connect(self._apply_resolved_device_status)
+        self.device_status_progress.connect(self._apply_device_status_progress)
         self.device_status_refresh_finished.connect(self._finish_status_refresh)
         
         self.device_items = {}  # Track device tree items by IP
@@ -3792,16 +3794,16 @@ class NetworkDiscoveryApp(QMainWindow):
             seen_ips.add(ip)
             devices_to_refresh.append((ip, item.text(4)))
             is_favorite = self.is_favorited_device(ip, item.text(4))
-            item.setText(0, 'Loading')
-            self._style_device_item(item, is_favorite, 'Loading')
+            item.setText(0, 'Loading (1/10)')
+            self._style_device_item(item, is_favorite, 'Loading (1/10)')
 
         for index in range(self.favorites_tree.topLevelItemCount()):
             item = self.favorites_tree.topLevelItem(index)
             ip = item.text(2)
             if not ip:
                 continue
-            item.setText(0, 'Loading')
-            self._style_device_item(item, True, 'Loading')
+            item.setText(0, 'Loading (1/10)')
+            self._style_device_item(item, True, 'Loading (1/10)')
 
         if not devices_to_refresh:
             self.update_status('No devices to refresh')
@@ -3827,7 +3829,7 @@ class NetworkDiscoveryApp(QMainWindow):
         try:
             with ThreadPoolExecutor(max_workers=self.status_refresh_workers) as executor:
                 future_map = {
-                    executor.submit(self.get_device_status_info, ip): (ip, mac)
+                    executor.submit(self.get_device_status_info, ip, self._make_status_progress_callback(ip, mac)): (ip, mac)
                     for ip, mac in devices_to_refresh
                 }
 
@@ -3852,6 +3854,28 @@ class NetworkDiscoveryApp(QMainWindow):
                     refreshed_count += 1
         finally:
             self.device_status_refresh_finished.emit(refreshed_count)
+
+    def _make_status_progress_callback(self, ip, mac):
+        """Create a thread-safe progress callback for one device status refresh."""
+        def callback(current_ping, total_pings):
+            self.device_status_progress.emit(ip, mac, current_ping, total_pings)
+        return callback
+
+    def _apply_device_status_progress(self, ip, mac, current_ping, total_pings):
+        """Update UI rows with the current ping attempt number."""
+        loading_text = f'Loading ({current_ping}/{total_pings})'
+
+        item = self.device_items.get(ip)
+        if item is not None:
+            is_favorite = self.is_favorited_device(ip, item.text(4))
+            item.setText(0, loading_text)
+            self._style_device_item(item, is_favorite, loading_text)
+
+        for index in range(self.favorites_tree.topLevelItemCount()):
+            favorite_item = self.favorites_tree.topLevelItem(index)
+            if favorite_item.text(2) == ip:
+                favorite_item.setText(0, loading_text)
+                self._style_device_item(favorite_item, True, loading_text)
 
     def _apply_resolved_device_status(self, ip, mac, status_text, success_count, total_count):
         """Apply one resolved status update to all matching rows."""
@@ -4191,30 +4215,40 @@ class NetworkDiscoveryApp(QMainWindow):
 
         return tree
 
-    def get_device_status_info(self, ip):
+    def get_device_status_info(self, ip, progress_callback=None):
         """Return ping-response details for a device status check."""
         clean_ip = (ip or '').strip()
         if not clean_ip:
             return {'status': 'Offline', 'success_count': 0, 'total_count': 10}
 
-        try:
-            result = subprocess.run(
-                ['ping', '-n', '10', '-w', str(self.scanner.ping_timeout_ms), clean_ip],
-                capture_output=True,
-                text=True,
-                timeout=2.0
-            )
-            output = result.stdout or ''
-            match = re.search(r'Received\s*=\s*(\d+)', output, re.IGNORECASE)
-            success_count = int(match.group(1)) if match else (10 if result.returncode == 0 else 0)
-            total_count = 10
-            return {
-                'status': 'Online' if success_count > 0 else 'Offline',
-                'success_count': success_count,
-                'total_count': total_count,
-            }
-        except Exception:
-            return {'status': 'Offline', 'success_count': 0, 'total_count': 10}
+        total_count = 10
+        success_count = 0
+        per_try_timeout_ms = 2000
+
+        for attempt_number in range(1, total_count + 1):
+            if progress_callback:
+                progress_callback(attempt_number, total_count)
+            try:
+                result = subprocess.run(
+                    ['ping', '-n', '1', '-w', str(per_try_timeout_ms), clean_ip],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.2
+                )
+                if result.returncode == 0:
+                    success_count += 1
+            except Exception:
+                pass
+
+            if success_count > 0:
+                # One success is enough to count as online; stop early to keep refresh fast.
+                break
+
+        return {
+            'status': 'Online' if success_count > 0 else 'Offline',
+            'success_count': success_count,
+            'total_count': total_count,
+        }
 
     def get_device_status_text(self, ip):
         """Return Online or Offline based on a quick ping check."""
@@ -4502,7 +4536,7 @@ class NetworkDiscoveryApp(QMainWindow):
         """Apply colors and typography to a device row."""
         if status_text == 'Online':
             status_color = QColor(46, 125, 50)
-        elif status_text == 'Loading':
+        elif status_text.startswith('Loading'):
             status_color = QColor(45, 123, 216)
         else:
             status_color = QColor(183, 28, 28)
