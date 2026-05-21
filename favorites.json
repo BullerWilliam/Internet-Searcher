@@ -1,0 +1,16 @@
+{
+  "mac:60:CF:84:CA:0D:07": {
+    "favorite_key": "mac:60:CF:84:CA:0D:07",
+    "ip": "192.168.0.153",
+    "name": "Buller",
+    "manufacturer": "ASUSTek COMPUTER INC.",
+    "mac": "60:CF:84:CA:0D:07"
+  },
+  "mac:92:23:83:CB:C8:A2": {
+    "favorite_key": "mac:92:23:83:CB:C8:A2",
+    "ip": "192.168.0.115",
+    "name": "Timmi - iPad",
+    "manufacturer": "",
+    "mac": "92:23:83:CB:C8:A2"
+  }
+}
