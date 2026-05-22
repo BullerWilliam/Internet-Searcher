@@ -273,22 +273,33 @@ class NetworkScanner(QObject):
     
     def _scan_single_ip(self, ip):
         """Scan a single IP address"""
-        is_alive = False
-        
+        if self._is_local_interface_ip(ip):
+            return ip, True
+
         try:
-            # Check if IP is reachable
             result = subprocess.run(
                 ['ping', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
                 capture_output=True,
-                timeout=self.process_timeout_sec
+                timeout=max(0.8, self.process_timeout_sec)
             )
-            
             if result.returncode == 0:
-                is_alive = True
+                return ip, True
         except Exception:
             pass
-        
-        return ip, is_alive
+
+        try:
+            fallback_timeout_ms = max(450, self.ping_timeout_ms * 2)
+            result = subprocess.run(
+                ['ping', '-n', '1', '-w', str(fallback_timeout_ms), ip],
+                capture_output=True,
+                timeout=max(1.2, self.process_timeout_sec * 1.5)
+            )
+            if result.returncode == 0:
+                return ip, True
+        except Exception:
+            pass
+
+        return ip, False
 
     def _make_loading_marker(self, marker_type, current_method, total_methods):
         """Create a machine-readable loading marker for UI formatting."""
@@ -389,10 +400,9 @@ class NetworkScanner(QObject):
             (1, lambda: self._clean_hostname(socket.gethostbyaddr(ip)[0].split('.')[0])),
             (7, lambda: self._lookup_wsd_friendly_name(ip)),
         ]
-        for method_number, probe in fast_probes:
-            hostname = run_probe(method_number, probe)
-            if hostname:
-                return hostname
+        hostname = self._run_hostname_probe_batch(ip, fast_probes, report_progress, max_workers=4)
+        if hostname:
+            return hostname
 
         # Medium-cost probes race in parallel so the first good answer wins.
         medium_probe_defs = [
@@ -1423,6 +1433,13 @@ class NetworkScanner(QObject):
     def _get_local_interface_mac(self, ip):
         """Return the MAC for one of this machine's own IPv4 addresses."""
         return self._load_local_interface_macs().get((ip or '').strip(), "")
+
+    def _is_local_interface_ip(self, ip):
+        """Return True when the IP belongs to this machine."""
+        clean_ip = (ip or '').strip()
+        if not clean_ip:
+            return False
+        return clean_ip in self._load_local_interface_macs()
 
     def _get_mac_from_arp(self, ip):
         """Get MAC address from ARP table"""
@@ -2984,23 +3001,22 @@ class NetworkDiscoveryApp(QMainWindow):
 
     def get_device_nickname(self, ip='', mac=''):
         """Return a saved nickname for a device when available."""
-        device_key = self.get_favorite_key(ip, mac)
+        clean_mac = (mac or '').strip()
+        if not clean_mac or clean_mac.lower() == 'unknown':
+            return ''
+
+        device_key = self.get_favorite_key('', clean_mac)
         if device_key and device_key in self.nicknames:
             return self.nicknames[device_key]
-
-        if ip:
-            for saved_key, nickname in self.nicknames.items():
-                if saved_key == f'ip:{ip}':
-                    return nickname
-            favorite_key, _ = self.find_favorite_by_ip(ip)
-            if favorite_key and favorite_key in self.nicknames:
-                return self.nicknames[favorite_key]
-
         return ''
 
     def set_device_nickname(self, ip, mac, nickname):
         """Persist a nickname for a device."""
-        device_key = self.get_favorite_key(ip, mac)
+        clean_mac = (mac or '').strip()
+        if not clean_mac or clean_mac.lower() == 'unknown':
+            return False
+
+        device_key = self.get_favorite_key('', clean_mac)
         if not device_key:
             return False
 
@@ -3014,12 +3030,15 @@ class NetworkDiscoveryApp(QMainWindow):
 
     def clear_device_nickname(self, ip, mac):
         """Remove a persisted nickname for a device."""
+        clean_mac = (mac or '').strip()
+        if not clean_mac or clean_mac.lower() == 'unknown':
+            return False
+
         removed = False
-        device_key = self.get_favorite_key(ip, mac)
-        for key in {device_key, f'ip:{(ip or "").strip()}'}:
-            if key and key in self.nicknames:
-                del self.nicknames[key]
-                removed = True
+        device_key = self.get_favorite_key('', clean_mac)
+        if device_key and device_key in self.nicknames:
+            del self.nicknames[device_key]
+            removed = True
         if removed:
             self.save_nicknames()
         return removed
@@ -3539,9 +3558,15 @@ class NetworkDiscoveryApp(QMainWindow):
         info_action.triggered.connect(lambda: self.show_device_info_dialog(item))
         open_explorer_action = menu.addAction("Open In Explorer")
         open_explorer_action.triggered.connect(lambda: self.open_device_in_explorer(item))
-        nickname_action = menu.addAction("Set Nickname")
-        nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
-        if self.get_device_nickname(item.text(2), item.text(4)):
+        mac = item.text(4).strip()
+        nickname_supported = bool(mac and mac.lower() != 'unknown')
+        if nickname_supported:
+            nickname_action = menu.addAction("Set Nickname")
+            nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
+        else:
+            nickname_action = menu.addAction("Nickname unavailable")
+            nickname_action.setEnabled(False)
+        if nickname_supported and self.get_device_nickname(item.text(2), item.text(4)):
             clear_nickname_action = menu.addAction("Clear Nickname")
             clear_nickname_action.triggered.connect(lambda: self.clear_nickname_for_item(item))
         menu.exec_(self.tree.mapToGlobal(position))
@@ -3563,9 +3588,15 @@ class NetworkDiscoveryApp(QMainWindow):
         info_action.triggered.connect(lambda: self.show_device_info_dialog(item))
         open_explorer_action = menu.addAction("Open In Explorer")
         open_explorer_action.triggered.connect(lambda: self.open_device_in_explorer(item))
-        nickname_action = menu.addAction("Set Nickname")
-        nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
-        if self.get_device_nickname(item.text(2), item.text(4)):
+        mac = item.text(4).strip()
+        nickname_supported = bool(mac and mac.lower() != 'unknown')
+        if nickname_supported:
+            nickname_action = menu.addAction("Set Nickname")
+            nickname_action.triggered.connect(lambda: self.prompt_for_nickname(item))
+        else:
+            nickname_action = menu.addAction("Nickname unavailable")
+            nickname_action.setEnabled(False)
+        if nickname_supported and self.get_device_nickname(item.text(2), item.text(4)):
             clear_nickname_action = menu.addAction("Clear Nickname")
             clear_nickname_action.triggered.connect(lambda: self.clear_nickname_for_item(item))
         menu.exec_(self.favorites_tree.mapToGlobal(position))
@@ -3574,8 +3605,9 @@ class NetworkDiscoveryApp(QMainWindow):
         """Collect a device info snapshot for dialogs and actions."""
         ip = item.text(2)
         mac = item.text(4)
+        nickname_supported = bool(mac and mac.strip() and mac.strip().lower() != 'unknown')
         raw_name = item.data(1, Qt.UserRole) or ''
-        nickname = self.get_device_nickname(ip, mac)
+        nickname = self.get_device_nickname(ip, mac) if nickname_supported else 'Nickname unsupported'
         display_name = self.get_display_name(raw_name, ip, mac)
         ping_stats = self.get_device_ping_stats(ip, mac)
         favorite = self.is_favorited_device(ip, mac)
@@ -3593,6 +3625,7 @@ class NetworkDiscoveryApp(QMainWindow):
             'display_name': display_name,
             'raw_name': raw_name,
             'nickname': nickname,
+            'nickname_supported': 'Yes' if nickname_supported else 'No',
             'status': status_text,
             'ip': ip,
             'mac': mac,
@@ -3627,6 +3660,7 @@ class NetworkDiscoveryApp(QMainWindow):
         fields = [
             ('Display name', info['display_name'] or 'Unknown'),
             ('Nickname', info['nickname'] or ''),
+            ('Nickname supported', info['nickname_supported']),
             ('Discovered name', info['raw_name'] or ''),
             ('Status', info['status'] or 'Unknown'),
             ('Ping response rate', ping_summary),
@@ -3671,6 +3705,10 @@ class NetworkDiscoveryApp(QMainWindow):
         """Prompt the user to set a custom nickname for a device."""
         ip = item.text(2)
         mac = item.text(4)
+        if not mac or mac.strip().lower() == 'unknown':
+            self.update_status('Nickname unsupported: no MAC address available')
+            return
+
         current_nickname = self.get_device_nickname(ip, mac)
         nickname, ok = QInputDialog.getText(
             self,
@@ -3694,6 +3732,10 @@ class NetworkDiscoveryApp(QMainWindow):
         """Clear a custom nickname for a device item."""
         ip = item.text(2)
         mac = item.text(4)
+        if not mac or mac.strip().lower() == 'unknown':
+            self.update_status('Nickname unsupported: no MAC address available')
+            return
+
         if self.clear_device_nickname(ip, mac):
             self.refresh_all_device_labels()
             self.update_status(f'Nickname cleared for {ip}')
@@ -4240,12 +4282,16 @@ class NetworkDiscoveryApp(QMainWindow):
             except Exception:
                 pass
 
-            if success_count > 0:
-                # One success is enough to count as online; stop early to keep refresh fast.
-                break
+        failed_count = total_count - success_count
+        if success_count > 0 and failed_count >= 2:
+            status_text = 'Unstable'
+        elif success_count > 0:
+            status_text = 'Online'
+        else:
+            status_text = 'Offline'
 
         return {
-            'status': 'Online' if success_count > 0 else 'Offline',
+            'status': status_text,
             'success_count': success_count,
             'total_count': total_count,
         }
@@ -4536,6 +4582,8 @@ class NetworkDiscoveryApp(QMainWindow):
         """Apply colors and typography to a device row."""
         if status_text == 'Online':
             status_color = QColor(46, 125, 50)
+        elif status_text == 'Unstable':
+            status_color = QColor(230, 145, 34)
         elif status_text.startswith('Loading'):
             status_color = QColor(45, 123, 216)
         else:
