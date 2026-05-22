@@ -35,6 +35,40 @@ warnings.filterwarnings(
 )
 
 
+def _hidden_subprocess_kwargs():
+    """Hide Windows console windows for subprocesses started by the GUI app."""
+    kwargs = {}
+    if os.name == 'nt':
+        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        if creationflags:
+            kwargs['creationflags'] = creationflags
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs['startupinfo'] = startupinfo
+    return kwargs
+
+
+def run_hidden_process(args, **kwargs):
+    """Run a subprocess without flashing a console window on Windows."""
+    merged = _hidden_subprocess_kwargs()
+    merged.update(kwargs)
+    return subprocess.run(args, **merged)
+
+
+def check_output_hidden(args, **kwargs):
+    """Capture subprocess output without flashing a console window on Windows."""
+    merged = _hidden_subprocess_kwargs()
+    merged.update(kwargs)
+    return subprocess.check_output(args, **merged)
+
+
+def popen_hidden(args, **kwargs):
+    """Start a subprocess without flashing a console window on Windows."""
+    merged = _hidden_subprocess_kwargs()
+    merged.update(kwargs)
+    return subprocess.Popen(args, **merged)
+
+
 class ResourceScanner(QObject):
     """Scanner for printers and file shares on discovered devices"""
     found_resource = pyqtSignal(str, str)  # (ip, resource_info)
@@ -42,8 +76,8 @@ class ResourceScanner(QObject):
     def find_printers(self, ip):
         """Find printers on a device"""
         try:
-            output = subprocess.check_output(
-                f'net view \\\\{ip}',
+            output = check_output_hidden(
+                ['net', 'view', f'\\\\{ip}'],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=2
@@ -60,8 +94,8 @@ class ResourceScanner(QObject):
         """Find shared folders and files on a device"""
         shares = []
         try:
-            output = subprocess.check_output(
-                f'net view \\\\{ip}',
+            output = check_output_hidden(
+                ['net', 'view', f'\\\\{ip}'],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=2
@@ -109,7 +143,8 @@ class NetworkScanner(QObject):
         self.resource_scanner = ResourceScanner()
         self.detail_executor = ThreadPoolExecutor(max_workers=self.detail_workers)
         self.resource_executor = ThreadPoolExecutor(max_workers=self.resource_workers)
-        self.storage_db_path = os.path.join(os.path.dirname(__file__), 'app_storage.db')
+        self.app_data_dir = self._resolve_app_data_dir()
+        self.storage_db_path = os.path.join(self.app_data_dir, 'app_storage.db')
         self.vendor_registry_max_age_sec = 30 * 24 * 60 * 60
         self.vendor_cache = {}
         self.vendor_cache_lock = threading.Lock()
@@ -137,6 +172,16 @@ class NetworkScanner(QObject):
         self.total_ips = 0
         self.scanned_count = 0
         self._ensure_storage_db()
+
+    def _resolve_app_data_dir(self):
+        """Return a stable writable directory for app-local data."""
+        local_appdata = os.environ.get('LOCALAPPDATA')
+        if local_appdata:
+            app_dir = os.path.join(local_appdata, 'AdvancedIPScanner')
+        else:
+            app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app_data')
+        os.makedirs(app_dir, exist_ok=True)
+        return app_dir
 
     def _db_connect(self):
         """Create a short-lived SQLite connection for local storage."""
@@ -277,7 +322,7 @@ class NetworkScanner(QObject):
             return ip, True
 
         try:
-            result = subprocess.run(
+            result = run_hidden_process(
                 ['ping', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
                 capture_output=True,
                 timeout=max(0.8, self.process_timeout_sec)
@@ -289,7 +334,7 @@ class NetworkScanner(QObject):
 
         try:
             fallback_timeout_ms = max(450, self.ping_timeout_ms * 2)
-            result = subprocess.run(
+            result = run_hidden_process(
                 ['ping', '-n', '1', '-w', str(fallback_timeout_ms), ip],
                 capture_output=True,
                 timeout=max(1.2, self.process_timeout_sec * 1.5)
@@ -455,7 +500,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_ping_a(self, ip):
         """Extract a hostname from `ping -a`."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             ['ping', '-a', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -468,7 +513,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_nbtstat(self, ip):
         """Extract a hostname from NetBIOS data."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             ['nbtstat', '-A', ip],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -478,7 +523,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_resolve_dns(self, ip):
         """Extract a hostname using PowerShell Resolve-DnsName."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             [
                 'powershell',
                 '-NoProfile',
@@ -500,7 +545,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_nslookup(self, ip):
         """Extract a hostname using nslookup."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             ['nslookup', ip],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -516,7 +561,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_wmic_computersystem(self, ip):
         """Extract a hostname from WMI computer system data."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             ['wmic', '/node:' + ip, 'computersystem', 'get', 'name'],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -530,7 +575,7 @@ class NetworkScanner(QObject):
 
     def _hostname_from_wmic_nicconfig(self, ip):
         """Extract a hostname from WMI NIC config data."""
-        output = subprocess.check_output(
+        output = check_output_hidden(
             ['wmic', '/node:' + ip, 'nicconfig', 'get', 'dnshostname'],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -544,8 +589,8 @@ class NetworkScanner(QObject):
 
     def _hostname_from_net_view(self, ip):
         """Extract a hostname from `net view` output."""
-        output = subprocess.check_output(
-            f'net view \\\\{ip}',
+        output = check_output_hidden(
+            ['net', 'view', f'\\\\{ip}'],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=0.8
@@ -1396,7 +1441,7 @@ class NetworkScanner(QObject):
 
             mappings = {}
             try:
-                output = subprocess.check_output(
+                output = check_output_hidden(
                     ['ipconfig', '/all'],
                     text=True,
                     encoding='utf-8',
@@ -1448,7 +1493,7 @@ class NetworkScanner(QObject):
             return local_mac
 
         try:
-            output = subprocess.check_output(['arp', '-a', ip], text=True)
+            output = check_output_hidden(['arp', '-a', ip], text=True)
             match = re.search(
                 rf'{re.escape(ip)}\s+(([0-9a-fA-F]{{2}}[-:]){{5}}[0-9a-fA-F]{{2}})',
                 output
@@ -1459,7 +1504,7 @@ class NetworkScanner(QObject):
             pass
 
         try:
-            output = subprocess.check_output(['arp', '-a'], text=True)
+            output = check_output_hidden(['arp', '-a'], text=True)
             match = re.search(
                 rf'{re.escape(ip)}\s+(([0-9a-fA-F]{{2}}[-:]){{5}}[0-9a-fA-F]{{2}})',
                 output
@@ -3696,7 +3741,7 @@ class NetworkDiscoveryApp(QMainWindow):
 
         network_path = f'\\\\{ip}'
         try:
-            subprocess.Popen(['explorer', network_path])
+            popen_hidden(['explorer', network_path])
             self.update_status(f'Opened {network_path} in Explorer')
         except Exception:
             self.update_status(f'Could not open {network_path} in Explorer')

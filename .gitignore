@@ -4,3 +4,13 @@ __pycache__/
 *.spec
 app_storage.db
 app_data/
+build/AdvancedIPScanner/AdvancedIPScanner.pkg
+__pycache__/network_info_app.cpython-311.pyc
+build/AdvancedIPScanner/AdvancedIPScanner.pkg
+build/AdvancedIPScanner/Analysis-00.toc
+build/AdvancedIPScanner/base_library.zip
+build/AdvancedIPScanner/EXE-00.toc
+build/AdvancedIPScanner/PKG-00.toc
+build/AdvancedIPScanner/warn-AdvancedIPScanner.txt
+build/AdvancedIPScanner/xref-AdvancedIPScanner.html
+dist/AdvancedIPScanner.exe
