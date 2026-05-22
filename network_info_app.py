@@ -137,8 +137,8 @@ class NetworkScanner(QObject):
         super().__init__()
         self.devices = {}
         self.max_workers = max(1, (os.cpu_count() or 4) * 4)
-        self.detail_workers = 1
-        self.resource_workers = 1
+        self.detail_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
+        self.resource_workers = 2
         self.ping_timeout_ms = 2000
         self.process_timeout_sec = 2.0
         self.resource_scanner = ResourceScanner()
@@ -290,6 +290,8 @@ class NetworkScanner(QObject):
         scan_workers = max(1, (len(ip_list) + 2) // 3)
         scan_workers = min(scan_workers, self.max_workers)
         
+        detail_futures = []
+
         with ThreadPoolExecutor(max_workers=scan_workers) as executor:
             futures = {}
             
@@ -313,29 +315,26 @@ class NetworkScanner(QObject):
                             'manufacturer': '',
                             'status': 'Online',
                         })
+                        self.add_device.emit({
+                            'ip': ip,
+                            'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
+                            'mac': '',
+                            'manufacturer': self._make_loading_marker(
+                                'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
+                            ),
+                            'status': 'Online',
+                        })
                         self.update_progress.emit(f"Found: {ip}")
+                        detail_futures.append(self.detail_executor.submit(self._collect_and_emit_details, ip))
                     else:
                         self.dead_count += 1
                 except Exception as e:
                     self.dead_count += 1
 
         if alive_ips:
-            self.update_progress.emit("Ping sweep finished. Starting device names and manufacturers...")
+            self.update_progress.emit("Ping sweep finished. Finishing names and manufacturers...")
         else:
             self.update_progress.emit("Ping sweep finished. No online devices found.")
-
-        detail_futures = []
-        for ip in sorted(alive_ips):
-            self.add_device.emit({
-                'ip': ip,
-                'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
-                'mac': '',
-                'manufacturer': self._make_loading_marker(
-                    'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
-                ),
-                'status': 'Online',
-            })
-            detail_futures.append(self.detail_executor.submit(self._collect_and_emit_details, ip))
 
         for future in as_completed(detail_futures):
             try:
@@ -345,9 +344,6 @@ class NetworkScanner(QObject):
 
     def _scan_single_ip(self, ip):
         """Scan a single IP address"""
-        if self._is_local_interface_ip(ip):
-            return ip, True
-
         try:
             ping_timeout_ms = 2000
             result = run_hidden_process(
@@ -381,12 +377,25 @@ class NetworkScanner(QObject):
             def emit_state():
                 self.add_device.emit(device_state.copy())
 
+            def on_name_progress(current_method, total_methods):
+                device_state['name'] = self._make_loading_marker('name', current_method, total_methods)
+                emit_state()
+
+            def on_manufacturer_progress(current_method, total_methods):
+                device_state['manufacturer'] = self._make_loading_marker(
+                    'manufacturer', current_method, total_methods
+                )
+                emit_state()
+
             emit_state()
-            name = self._get_hostname(ip)
+            name = self._get_hostname(ip, on_name_progress)
             mac = self._get_mac_from_arp(ip)
             device_state['mac'] = mac
 
-            manufacturer = self._get_manufacturer_from_mac(mac)
+            manufacturer = self._get_manufacturer_from_mac(
+                mac,
+                progress_callback=on_manufacturer_progress
+            )
             device_state['manufacturer'] = manufacturer
             emit_state()
 
@@ -397,7 +406,7 @@ class NetworkScanner(QObject):
         except Exception:
             pass
 
-        self._scan_resources(ip)
+        self.resource_executor.submit(self._scan_resources, ip)
     
     def _scan_resources(self, ip):
         """Scan for printers and shared files on a device"""
@@ -5246,7 +5255,8 @@ class NetworkDiscoveryApp(QMainWindow):
 
         hint_label = QLabel(
             'Fast scan threads cap the sweep, but the scanner now uses about one worker per three devices. '
-            'Lower detail lookup threads and resource lookup threads will make name fetching gentler on the PC.'
+            'Lower detail lookup threads and resource lookup threads will make name fetching gentler on the PC. '
+            'A small amount of parallel detail work helps loading finish instead of stalling behind one slow device.'
         )
         hint_label.setWordWrap(True)
         layout.addWidget(hint_label)
@@ -5322,7 +5332,12 @@ class NetworkDiscoveryApp(QMainWindow):
         previous_local_virtual = self._is_virtual_adapter_label(previous_manufacturer)
         current_local_virtual = self._is_virtual_adapter_label(manufacturer)
 
-        if self.is_loading_marker(raw_name) and previous_name and not self.is_loading_marker(previous_name):
+        if (
+            self.is_loading_marker(raw_name)
+            and previous_name
+            and previous_name != 'Unknown'
+            and not self.is_loading_marker(previous_name)
+        ):
             raw_name = previous_name
         elif (
             raw_name == 'Unknown'
