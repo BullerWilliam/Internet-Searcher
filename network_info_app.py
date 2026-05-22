@@ -285,6 +285,7 @@ class NetworkScanner(QObject):
         vendor_prefetch_thread.start()
         local_mac_prefetch_thread = threading.Thread(target=self._load_local_interface_macs, daemon=True)
         local_mac_prefetch_thread.start()
+        alive_ips = set()
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
@@ -300,10 +301,11 @@ class NetworkScanner(QObject):
                 try:
                     ip, is_alive = future.result()
                     if is_alive:
+                        alive_ips.add(ip)
                         self.alive_count += 1
                         self.add_device.emit({
                             'ip': ip,
-                            'name': self._make_loading_marker('name', 6, self.HOSTNAME_METHOD_COUNT),
+                            'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
                             'mac': '',
                             'manufacturer': self._make_loading_marker(
                                 'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
@@ -316,7 +318,7 @@ class NetworkScanner(QObject):
                         self.dead_count += 1
                 except Exception as e:
                     self.dead_count += 1
-    
+
     def _scan_single_ip(self, ip):
         """Scan a single IP address"""
         if self._is_local_interface_ip(ip):
@@ -346,7 +348,6 @@ class NetworkScanner(QObject):
             pass
 
         return ip, False
-
     def _make_loading_marker(self, marker_type, current_method, total_methods):
         """Create a machine-readable loading marker for UI formatting."""
         return f'__{marker_type.upper()}_LOADING__:{int(current_method)}:{int(total_methods)}'
@@ -356,7 +357,7 @@ class NetworkScanner(QObject):
         try:
             device_state = {
                 'ip': ip,
-                'name': self._make_loading_marker('name', 6, self.HOSTNAME_METHOD_COUNT),
+                'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
                 'mac': '',
                 'manufacturer': self._make_loading_marker(
                     'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
@@ -424,6 +425,15 @@ class NetworkScanner(QObject):
             cached_name = self.hostname_cache.get(ip)
             if cached_name:
                 return cached_name
+
+        if self._is_local_interface_ip(ip):
+            local_name = self._clean_hostname(
+                os.environ.get('COMPUTERNAME') or socket.gethostname()
+            )
+            if local_name:
+                if progress_callback:
+                    progress_callback(1, self.HOSTNAME_METHOD_COUNT)
+                return self._cache_hostname(ip, local_name)
 
         def report_progress(method_number):
             if progress_callback:
@@ -2776,6 +2786,7 @@ class NetworkDiscoveryApp(QMainWindow):
         self.device_status_refresh_finished.connect(self._finish_status_refresh)
         
         self.device_items = {}  # Track device tree items by IP
+        self.device_identity_items = {}  # Track device tree items by stable identity
         self.is_scanning = False
         self.is_refreshing_status = False
         self.status_refresh_thread = None
@@ -3184,6 +3195,15 @@ class NetworkDiscoveryApp(QMainWindow):
             and not clean_name.startswith('__NAME_LOADING__:')
         )
 
+    def is_loading_marker(self, value):
+        """Return True when a value is one of the scanner's loading placeholders."""
+        clean_value = (value or '').strip()
+        return bool(
+            clean_value == '__LOADING__'
+            or clean_value.startswith('__NAME_LOADING__:')
+            or clean_value.startswith('__MANUFACTURER_LOADING__:')
+        )
+
     def format_manufacturer_label(self, manufacturer):
         """Format the visible manufacturer label."""
         clean_manufacturer = (manufacturer or '').strip()
@@ -3335,6 +3355,7 @@ class NetworkDiscoveryApp(QMainWindow):
         # Reset UI
         self.tree.clear()
         self.device_items = {}
+        self.device_identity_items = {}
         self.scanner.alive_count = 0
         self.scanner.dead_count = 0
         self.scanner.scanned_count = 0
@@ -5192,32 +5213,83 @@ class NetworkDiscoveryApp(QMainWindow):
 
     def add_device_to_tree(self, device):
         """Add a discovered device using a combined name/IP label."""
-        item = self.device_items.get(device['ip'])
+        device_ip = (device.get('ip') or '').strip()
+        device_mac = (device.get('mac') or '').strip()
+        normalized_mac = self.scanner._normalize_mac_address(device_mac)
+        raw_name = device.get('name', '')
+        manufacturer = device.get('manufacturer', '')
+
+        identity_key = f'mac:{normalized_mac}' if normalized_mac else f'ip:{device_ip}'
+        identity_item = self.device_identity_items.get(identity_key) if normalized_mac else None
+        ip_item = self.device_items.get(device_ip)
+        item = identity_item or ip_item
         is_new_item = item is None
         if is_new_item:
             item = QTreeWidgetItem()
-        is_favorite = self.is_favorited_device(device['ip'], device['mac'])
+        elif identity_item is not None and ip_item is not None and identity_item is not ip_item:
+            duplicate_index = self.tree.indexOfTopLevelItem(ip_item)
+            if duplicate_index >= 0:
+                self.tree.takeTopLevelItem(duplicate_index)
+
+        previous_ip = item.text(2).strip()
+        previous_mac = self.scanner._normalize_mac_address(item.text(4))
+        previous_name = item.data(1, Qt.UserRole) or ''
+        previous_manufacturer = item.text(3)
+
+        if self.is_loading_marker(raw_name) and previous_name and not self.is_loading_marker(previous_name):
+            raw_name = previous_name
+        elif raw_name == 'Unknown' and previous_name and previous_name != 'Unknown':
+            raw_name = previous_name
+
+        if not normalized_mac and previous_mac:
+            device_mac = previous_mac
+            normalized_mac = previous_mac
+
+        if (
+            (not manufacturer or self.is_loading_marker(manufacturer))
+            and previous_manufacturer
+            and previous_manufacturer != self.format_manufacturer_label('')
+        ):
+            manufacturer = previous_manufacturer
+        elif manufacturer == '' and previous_manufacturer:
+            manufacturer = previous_manufacturer
+
+        effective_ip = previous_ip or device_ip
+        if not previous_ip:
+            effective_ip = device_ip
+        elif previous_mac and normalized_mac and previous_mac != normalized_mac:
+            effective_ip = device_ip
+
+        is_favorite = self.is_favorited_device(device_ip, device_mac)
         status_text = self.resolve_status_for_device(device)
-        display_name = self.get_display_name(device['name'], device['ip'], device['mac'])
-        nickname = self.get_device_nickname(device['ip'], device['mac'])
+        display_name = self.get_display_name(raw_name, effective_ip, device_mac)
+        nickname = self.get_device_nickname(device_ip, device_mac)
 
         item.setText(0, status_text)
-        item.setText(1, self.format_device_label(display_name, device['ip']))
-        item.setText(2, device['ip'])
-        item.setText(3, self.format_manufacturer_label(device['manufacturer']))
-        item.setText(4, device['mac'])
-        item.setData(1, Qt.UserRole, device['name'])
+        item.setText(1, self.format_device_label(display_name, effective_ip))
+        item.setText(2, effective_ip)
+        item.setText(3, self.format_manufacturer_label(manufacturer))
+        item.setText(4, device_mac)
+        item.setData(1, Qt.UserRole, raw_name)
         item.setData(1, Qt.UserRole + 1, nickname)
-        self.save_device_status(device['ip'], device['mac'], status_text)
+        self.save_device_status(device_ip, device_mac, status_text)
 
         self._style_device_item(item, is_favorite, status_text)
 
         if is_favorite:
-            self.refresh_favorite_from_device(device)
+            merged_device = dict(device)
+            merged_device['ip'] = effective_ip
+            merged_device['mac'] = device_mac
+            merged_device['name'] = raw_name
+            merged_device['manufacturer'] = manufacturer
+            self.refresh_favorite_from_device(merged_device)
 
         if is_new_item:
             self.tree.addTopLevelItem(item)
-        self.device_items[device['ip']] = item
+        self.device_items[device_ip] = item
+        if effective_ip:
+            self.device_items[effective_ip] = item
+        self.device_identity_items[identity_key] = item
         self.sort_device_tree(self.tree)
         self.apply_filter()
 
