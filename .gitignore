@@ -1,3 +1,6 @@
-/dist
-/build
-/_pycache_
+dist/
+build/
+__pycache__/
+*.spec
+app_storage.db
+app_data/
