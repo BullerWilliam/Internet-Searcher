@@ -44,6 +44,7 @@ def _hidden_subprocess_kwargs():
             kwargs['creationflags'] = creationflags
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
         kwargs['startupinfo'] = startupinfo
     return kwargs
 
@@ -4316,7 +4317,7 @@ class NetworkDiscoveryApp(QMainWindow):
             if progress_callback:
                 progress_callback(attempt_number, total_count)
             try:
-                result = subprocess.run(
+                result = run_hidden_process(
                     ['ping', '-n', '1', '-w', str(per_try_timeout_ms), clean_ip],
                     capture_output=True,
                     text=True,
@@ -4440,7 +4441,7 @@ class NetworkDiscoveryApp(QMainWindow):
             ranges.append(cidr_text)
 
         try:
-            output = subprocess.check_output(
+            output = check_output_hidden(
                 ['ipconfig'],
                 text=True,
                 encoding='utf-8',
