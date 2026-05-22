@@ -136,11 +136,11 @@ class NetworkScanner(QObject):
     def __init__(self):
         super().__init__()
         self.devices = {}
-        self.max_workers = min(128, max(48, (os.cpu_count() or 4) * 12))
-        self.detail_workers = min(32, max(8, (os.cpu_count() or 4) * 4))
-        self.resource_workers = 12
-        self.ping_timeout_ms = 220
-        self.process_timeout_sec = 0.9
+        self.max_workers = max(1, (os.cpu_count() or 4) * 4)
+        self.detail_workers = 1
+        self.resource_workers = 1
+        self.ping_timeout_ms = 2000
+        self.process_timeout_sec = 2.0
         self.resource_scanner = ResourceScanner()
         self.detail_executor = ThreadPoolExecutor(max_workers=self.detail_workers)
         self.resource_executor = ThreadPoolExecutor(max_workers=self.resource_workers)
@@ -152,6 +152,7 @@ class NetworkScanner(QObject):
         self.vendor_registry = {}
         self.vendor_registry_lock = threading.Lock()
         self.vendor_registry_loaded = False
+        self.vendor_registry_refresh_started = False
         self.mdns_service_cache = {}
         self.mdns_cache_lock = threading.Lock()
         self.mdns_cache_populated = False
@@ -207,14 +208,14 @@ class NetworkScanner(QObject):
         """Apply scanner settings without requiring an app restart."""
         with self.executor_settings_lock:
             if max_workers is not None:
-                self.max_workers = max(16, int(max_workers))
+                self.max_workers = max(1, int(max_workers))
             if ping_timeout_ms is not None:
-                self.ping_timeout_ms = max(50, int(ping_timeout_ms))
+                self.ping_timeout_ms = max(2000, int(ping_timeout_ms))
             if process_timeout_sec is not None:
-                self.process_timeout_sec = max(0.1, float(process_timeout_sec))
+                self.process_timeout_sec = max(2.0, float(process_timeout_sec))
 
             if detail_workers is not None:
-                detail_workers = max(4, int(detail_workers))
+                detail_workers = max(1, int(detail_workers))
                 if detail_workers != self.detail_workers:
                     old_executor = self.detail_executor
                     self.detail_workers = detail_workers
@@ -222,7 +223,7 @@ class NetworkScanner(QObject):
                     old_executor.shutdown(wait=False, cancel_futures=False)
 
             if resource_workers is not None:
-                resource_workers = max(2, int(resource_workers))
+                resource_workers = max(1, int(resource_workers))
                 if resource_workers != self.resource_workers:
                     old_executor = self.resource_executor
                     self.resource_workers = resource_workers
@@ -286,8 +287,10 @@ class NetworkScanner(QObject):
         local_mac_prefetch_thread = threading.Thread(target=self._load_local_interface_macs, daemon=True)
         local_mac_prefetch_thread.start()
         alive_ips = set()
+        scan_workers = max(1, (len(ip_list) + 2) // 3)
+        scan_workers = min(scan_workers, self.max_workers)
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=scan_workers) as executor:
             futures = {}
             
             for ip in ip_list:
@@ -305,19 +308,40 @@ class NetworkScanner(QObject):
                         self.alive_count += 1
                         self.add_device.emit({
                             'ip': ip,
-                            'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
+                            'name': 'Unknown',
                             'mac': '',
-                            'manufacturer': self._make_loading_marker(
-                                'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
-                            ),
+                            'manufacturer': '',
                             'status': 'Online',
                         })
                         self.update_progress.emit(f"Found: {ip}")
-                        self.detail_executor.submit(self._collect_and_emit_details, ip)
                     else:
                         self.dead_count += 1
                 except Exception as e:
                     self.dead_count += 1
+
+        if alive_ips:
+            self.update_progress.emit("Ping sweep finished. Starting device names and manufacturers...")
+        else:
+            self.update_progress.emit("Ping sweep finished. No online devices found.")
+
+        detail_futures = []
+        for ip in sorted(alive_ips):
+            self.add_device.emit({
+                'ip': ip,
+                'name': self._make_loading_marker('name', 5, self.HOSTNAME_METHOD_COUNT),
+                'mac': '',
+                'manufacturer': self._make_loading_marker(
+                    'manufacturer', 1, self.MANUFACTURER_METHOD_COUNT
+                ),
+                'status': 'Online',
+            })
+            detail_futures.append(self.detail_executor.submit(self._collect_and_emit_details, ip))
+
+        for future in as_completed(detail_futures):
+            try:
+                future.result()
+            except Exception:
+                pass
 
     def _scan_single_ip(self, ip):
         """Scan a single IP address"""
@@ -325,22 +349,11 @@ class NetworkScanner(QObject):
             return ip, True
 
         try:
+            ping_timeout_ms = 2000
             result = run_hidden_process(
-                ['ping', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
+                ['ping', '-n', '1', '-w', str(ping_timeout_ms), ip],
                 capture_output=True,
-                timeout=max(0.8, self.process_timeout_sec)
-            )
-            if result.returncode == 0:
-                return ip, True
-        except Exception:
-            pass
-
-        try:
-            fallback_timeout_ms = max(450, self.ping_timeout_ms * 2)
-            result = run_hidden_process(
-                ['ping', '-n', '1', '-w', str(fallback_timeout_ms), ip],
-                capture_output=True,
-                timeout=max(1.2, self.process_timeout_sec * 1.5)
+                timeout=2.2
             )
             if result.returncode == 0:
                 return ip, True
@@ -368,32 +381,14 @@ class NetworkScanner(QObject):
             def emit_state():
                 self.add_device.emit(device_state.copy())
 
-            def on_name_progress(current_method, total_methods):
-                device_state['name'] = self._make_loading_marker('name', current_method, total_methods)
-                emit_state()
-
-            def on_manufacturer_progress(current_method, total_methods):
-                device_state['manufacturer'] = self._make_loading_marker(
-                    'manufacturer', current_method, total_methods
-                )
-                emit_state()
-
             emit_state()
-            with ThreadPoolExecutor(max_workers=2) as detail_executor:
-                hostname_future = detail_executor.submit(self._get_hostname, ip, on_name_progress)
-                mac_future = detail_executor.submit(self._get_mac_from_arp, ip)
+            name = self._get_hostname(ip)
+            mac = self._get_mac_from_arp(ip)
+            device_state['mac'] = mac
 
-                mac = mac_future.result()
-                device_state['mac'] = mac
-
-                manufacturer = self._get_manufacturer_from_mac(
-                    mac,
-                    progress_callback=on_manufacturer_progress
-                )
-                device_state['manufacturer'] = manufacturer
-                emit_state()
-
-                name = hostname_future.result()
+            manufacturer = self._get_manufacturer_from_mac(mac)
+            device_state['manufacturer'] = manufacturer
+            emit_state()
 
             device_state['name'] = name
             device_state['mac'] = mac
@@ -402,7 +397,7 @@ class NetworkScanner(QObject):
         except Exception:
             pass
 
-        self.resource_executor.submit(self._scan_resources, ip)
+        self._scan_resources(ip)
     
     def _scan_resources(self, ip):
         """Scan for printers and shared files on a device"""
@@ -491,6 +486,10 @@ class NetworkScanner(QObject):
             self.hostname_cache[ip] = hostname
         return hostname
 
+    def _hostname_probe_timeout(self, minimum_seconds):
+        """Use the user-configured timeout, but keep slower name probes viable."""
+        return max(float(minimum_seconds), float(self.process_timeout_sec))
+
     def _run_hostname_probe_batch(self, ip, probe_defs, report_progress, max_workers):
         """Race a batch of hostname probes and return the first successful result."""
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -515,7 +514,7 @@ class NetworkScanner(QObject):
             ['ping', '-a', '-n', '1', '-w', str(self.ping_timeout_ms), ip],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=self.process_timeout_sec
+            timeout=self._hostname_probe_timeout(1.5)
         )
         match = re.search(r'Pinging\s+(.+?)\s+\[' + re.escape(ip) + r'\]', output, re.IGNORECASE)
         if match:
@@ -528,7 +527,7 @@ class NetworkScanner(QObject):
             ['nbtstat', '-A', ip],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.8
+            timeout=self._hostname_probe_timeout(2.5)
         )
         return self._extract_hostname_from_nbtstat(output)
 
@@ -546,7 +545,7 @@ class NetworkScanner(QObject):
             ],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.9
+            timeout=self._hostname_probe_timeout(3.0)
         )
         for line in output.split('\n'):
             hostname = self._clean_hostname(line)
@@ -560,7 +559,7 @@ class NetworkScanner(QObject):
             ['nslookup', ip],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.8
+            timeout=self._hostname_probe_timeout(2.5)
         )
         for line in output.split('\n'):
             line = line.strip()
@@ -570,13 +569,13 @@ class NetworkScanner(QObject):
                     return hostname
         return None
 
-    def _hostname_from_wmic_computersystem(self, ip):
-        """Extract a hostname from WMI computer system data."""
+    def _run_powershell_hostname_query(self, script, minimum_timeout=3.0):
+        """Run a PowerShell hostname query and return the first usable line."""
         output = check_output_hidden(
-            ['wmic', '/node:' + ip, 'computersystem', 'get', 'name'],
+            ['powershell', '-NoProfile', '-Command', script],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.9
+            timeout=self._hostname_probe_timeout(minimum_timeout)
         )
         for line in output.split('\n'):
             hostname = self._clean_hostname(line)
@@ -584,19 +583,57 @@ class NetworkScanner(QObject):
                 return hostname
         return None
 
+    def _hostname_from_wmic_computersystem(self, ip):
+        """Extract a hostname from WMI computer system data."""
+        try:
+            output = check_output_hidden(
+                ['wmic', '/node:' + ip, 'computersystem', 'get', 'name'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self._hostname_probe_timeout(3.0)
+            )
+            for line in output.split('\n'):
+                hostname = self._clean_hostname(line)
+                if hostname:
+                    return hostname
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+
+        return self._run_powershell_hostname_query(
+            (
+                f"$result = Get-WmiObject -Class Win32_ComputerSystem -ComputerName '{ip}' "
+                "-ErrorAction SilentlyContinue; "
+                "if ($result) { $result.Name }"
+            ),
+            minimum_timeout=3.0
+        )
+
     def _hostname_from_wmic_nicconfig(self, ip):
         """Extract a hostname from WMI NIC config data."""
-        output = check_output_hidden(
-            ['wmic', '/node:' + ip, 'nicconfig', 'get', 'dnshostname'],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=0.9
+        try:
+            output = check_output_hidden(
+                ['wmic', '/node:' + ip, 'nicconfig', 'get', 'dnshostname'],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self._hostname_probe_timeout(3.0)
+            )
+            for line in output.split('\n'):
+                hostname = self._clean_hostname(line)
+                if hostname:
+                    return hostname
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+
+        return self._run_powershell_hostname_query(
+            (
+                f"$result = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -ComputerName '{ip}' "
+                "-ErrorAction SilentlyContinue | "
+                "Where-Object { $_.DNSHostName } | "
+                "Select-Object -ExpandProperty DNSHostName -First 1; "
+                "if ($result) { $result }"
+            ),
+            minimum_timeout=3.0
         )
-        for line in output.split('\n'):
-            hostname = self._clean_hostname(line)
-            if hostname:
-                return hostname
-        return None
 
     def _hostname_from_net_view(self, ip):
         """Extract a hostname from `net view` output."""
@@ -604,7 +641,7 @@ class NetworkScanner(QObject):
             ['net', 'view', f'\\\\{ip}'],
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=0.8
+            timeout=self._hostname_probe_timeout(2.5)
         )
         first_line = output.split('\n', 1)[0].strip()
         match = re.search(r'\\\\([^\\\s]+)', first_line)
@@ -992,7 +1029,7 @@ class NetworkScanner(QObject):
             if self.mdns_cache_populated:
                 return self.mdns_service_cache.get(ip)
 
-        discovered_names = self._discover_mdns_service_names_cached()
+        self._discover_mdns_service_names_cached()
 
         with self.mdns_cache_lock:
             return self.mdns_service_cache.get(ip)
@@ -1542,14 +1579,7 @@ class NetworkScanner(QObject):
             if prefix in self.vendor_cache:
                 return self.vendor_cache[prefix]
 
-        report_progress(1)
-        manufacturer = self._lookup_vendor_from_registry(normalized_mac)
-        if manufacturer:
-            with self.vendor_cache_lock:
-                self.vendor_cache[prefix] = manufacturer
-            return manufacturer
-
-        # Fast built-in hints for common cases before the online fallback.
+        # Fast built-in hints for common cases before heavier lookups.
         mac_prefixes = {
     "00:00:0C": "Cisco",
     "00:00:39": "Toshiba",
@@ -2526,11 +2556,16 @@ class NetworkScanner(QObject):
     "FC:D8:48": "Apple",
     "FC:FB:FB": "Cisco",
 }
-
-
-        report_progress(2)
+        report_progress(1)
         if prefix in mac_prefixes:
             manufacturer = mac_prefixes[prefix]
+            with self.vendor_cache_lock:
+                self.vendor_cache[prefix] = manufacturer
+            return manufacturer
+
+        report_progress(2)
+        manufacturer = self._lookup_vendor_from_registry(normalized_mac)
+        if manufacturer:
             with self.vendor_cache_lock:
                 self.vendor_cache[prefix] = manufacturer
             return manufacturer
@@ -2543,7 +2578,7 @@ class NetworkScanner(QObject):
 
     def _lookup_vendor_from_registry(self, mac):
         """Lookup vendor using locally cached IEEE and Wireshark data."""
-        registry = self._ensure_vendor_registry_loaded()
+        registry = self._get_vendor_registry_for_lookup()
         hex_mac = re.sub(r'[^0-9A-F]', '', mac.upper())
         if len(hex_mac) < 12:
             return ""
@@ -2561,6 +2596,24 @@ class NetworkScanner(QObject):
 
         return ""
 
+    def _get_vendor_registry_for_lookup(self):
+        """Return a ready vendor registry without blocking on a fresh network rebuild."""
+        with self.vendor_registry_lock:
+            if self.vendor_registry_loaded:
+                return self.vendor_registry
+
+            registry = self._load_vendor_registry_from_disk()
+            if registry is not None:
+                self.vendor_registry = registry
+                self.vendor_registry_loaded = True
+                return self.vendor_registry
+
+            if not self.vendor_registry_refresh_started:
+                self.vendor_registry_refresh_started = True
+                threading.Thread(target=self._refresh_vendor_registry_background, daemon=True).start()
+
+            return {'mask_map': {}, 'mask_order': []}
+
     def _ensure_vendor_registry_loaded(self):
         """Load the local vendor registry, refreshing from the network when needed."""
         with self.vendor_registry_lock:
@@ -2576,7 +2629,18 @@ class NetworkScanner(QObject):
 
             self.vendor_registry = registry
             self.vendor_registry_loaded = True
+            self.vendor_registry_refresh_started = False
             return self.vendor_registry
+
+    def _refresh_vendor_registry_background(self):
+        """Build the vendor registry in the background for later lookups."""
+        registry = self._refresh_vendor_registry()
+        with self.vendor_registry_lock:
+            if registry is None:
+                registry = {'mask_map': {}, 'mask_order': []}
+            self.vendor_registry = registry
+            self.vendor_registry_loaded = True
+            self.vendor_registry_refresh_started = False
 
     def _load_vendor_registry_from_disk(self):
         """Load the cached vendor registry from local SQLite storage."""
@@ -4376,6 +4440,21 @@ class NetworkDiscoveryApp(QMainWindow):
             return status_text
         return self.get_cached_device_status(ip, mac)
 
+    def _is_virtual_adapter_label(self, text):
+        """Return True when a manufacturer/vendor label looks virtual."""
+        clean_text = (text or '').strip().lower()
+        if not clean_text:
+            return False
+        virtual_tokens = (
+            'hyper-v',
+            'vmware',
+            'virtual',
+            'virtualbox',
+            'qemu',
+            'parallels'
+        )
+        return any(token in clean_text for token in virtual_tokens)
+
     def apply_filter(self):
         """Filter both trees by the search box."""
         query = ''
@@ -5134,24 +5213,24 @@ class NetworkDiscoveryApp(QMainWindow):
         named_only_default_checkbox.setChecked(bool(self.settings.get('named_only_default', False)))
 
         max_workers_spin = QSpinBox()
-        max_workers_spin.setRange(16, 1024)
+        max_workers_spin.setRange(1, 1024)
         max_workers_spin.setValue(int(self.settings.get('max_workers', self.scanner.max_workers)))
 
         detail_workers_spin = QSpinBox()
-        detail_workers_spin.setRange(4, 256)
+        detail_workers_spin.setRange(1, 256)
         detail_workers_spin.setValue(int(self.settings.get('detail_workers', self.scanner.detail_workers)))
 
         resource_workers_spin = QSpinBox()
-        resource_workers_spin.setRange(2, 256)
+        resource_workers_spin.setRange(1, 256)
         resource_workers_spin.setValue(int(self.settings.get('resource_workers', self.scanner.resource_workers)))
 
         ping_timeout_spin = QSpinBox()
-        ping_timeout_spin.setRange(50, 5000)
+        ping_timeout_spin.setRange(2000, 5000)
         ping_timeout_spin.setSuffix(' ms')
         ping_timeout_spin.setValue(int(self.settings.get('ping_timeout_ms', self.scanner.ping_timeout_ms)))
 
         process_timeout_spin = QDoubleSpinBox()
-        process_timeout_spin.setRange(0.1, 10.0)
+        process_timeout_spin.setRange(2.0, 10.0)
         process_timeout_spin.setSingleStep(0.1)
         process_timeout_spin.setSuffix(' s')
         process_timeout_spin.setDecimals(1)
@@ -5166,8 +5245,8 @@ class NetworkDiscoveryApp(QMainWindow):
         layout.addLayout(form)
 
         hint_label = QLabel(
-            'Higher thread counts scan faster but can be noisier. '
-            'Lower timeouts are faster but may miss slower devices.'
+            'Fast scan threads cap the sweep, but the scanner now uses about one worker per three devices. '
+            'Lower detail lookup threads and resource lookup threads will make name fetching gentler on the PC.'
         )
         hint_label.setWordWrap(True)
         layout.addWidget(hint_label)
@@ -5218,9 +5297,14 @@ class NetworkDiscoveryApp(QMainWindow):
         normalized_mac = self.scanner._normalize_mac_address(device_mac)
         raw_name = device.get('name', '')
         manufacturer = device.get('manufacturer', '')
+        is_local_interface = self.scanner._is_local_interface_ip(device_ip)
 
-        identity_key = f'mac:{normalized_mac}' if normalized_mac else f'ip:{device_ip}'
-        identity_item = self.device_identity_items.get(identity_key) if normalized_mac else None
+        if is_local_interface:
+            identity_key = 'local-machine'
+            identity_item = self.device_identity_items.get(identity_key)
+        else:
+            identity_key = f'mac:{normalized_mac}' if normalized_mac else f'ip:{device_ip}'
+            identity_item = self.device_identity_items.get(identity_key) if normalized_mac else None
         ip_item = self.device_items.get(device_ip)
         item = identity_item or ip_item
         is_new_item = item is None
@@ -5235,28 +5319,48 @@ class NetworkDiscoveryApp(QMainWindow):
         previous_mac = self.scanner._normalize_mac_address(item.text(4))
         previous_name = item.data(1, Qt.UserRole) or ''
         previous_manufacturer = item.text(3)
+        previous_local_virtual = self._is_virtual_adapter_label(previous_manufacturer)
+        current_local_virtual = self._is_virtual_adapter_label(manufacturer)
 
         if self.is_loading_marker(raw_name) and previous_name and not self.is_loading_marker(previous_name):
             raw_name = previous_name
-        elif raw_name == 'Unknown' and previous_name and previous_name != 'Unknown':
+        elif (
+            raw_name == 'Unknown'
+            and previous_name
+            and previous_name != 'Unknown'
+            and not self.is_loading_marker(previous_name)
+        ):
             raw_name = previous_name
 
         if not normalized_mac and previous_mac:
             device_mac = previous_mac
             normalized_mac = previous_mac
 
+        if is_local_interface and previous_ip:
+            if not previous_local_virtual and current_local_virtual:
+                device_mac = previous_mac or device_mac
+                normalized_mac = previous_mac or normalized_mac
+                manufacturer = previous_manufacturer or manufacturer
+
+        previous_manufacturer_loading = previous_manufacturer.startswith('(loading manufacturer ')
         if (
             (not manufacturer or self.is_loading_marker(manufacturer))
             and previous_manufacturer
             and previous_manufacturer != self.format_manufacturer_label('')
+            and not previous_manufacturer_loading
         ):
             manufacturer = previous_manufacturer
-        elif manufacturer == '' and previous_manufacturer:
+        elif manufacturer == '' and previous_manufacturer and not previous_manufacturer_loading:
             manufacturer = previous_manufacturer
 
         effective_ip = previous_ip or device_ip
         if not previous_ip:
             effective_ip = device_ip
+        elif is_local_interface:
+            if previous_local_virtual and not current_local_virtual:
+                effective_ip = device_ip
+            elif not previous_local_virtual and current_local_virtual:
+                effective_ip = previous_ip
         elif previous_mac and normalized_mac and previous_mac != normalized_mac:
             effective_ip = device_ip
 
